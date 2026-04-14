@@ -68,41 +68,36 @@ jobs:
             "GEMMA4_OK=false" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
 
-      # ── 3. Cache Intel oneAPI ──────────────────────────────────────────────
-      - name: Cache Intel oneAPI installation
-        id: cache-oneapi
-        uses: actions/cache@v4
+      # ── 3. Set up conda with Intel channel ────────────────────────────────
+      - name: Setup conda (Miniconda)
+        uses: conda-incubator/setup-miniconda@v3
         with:
-          path: C:/Program Files (x86)/Intel/oneAPI
-          key: oneapi-2025.0-win-dpcpp-mkl-tbb-v1
+          miniconda-version: latest
+          activate-environment: sycl-build
+          python-version: '3.11'
 
-      # ── 4. Install Intel oneAPI (only on cache miss) ───────────────────────
-      - name: Install Intel oneAPI minimal components
-        if: steps.cache-oneapi.outputs.cache-hit != 'true'
-        shell: pwsh
+      # ── 4. Install Intel DPC++, MKL and TBB via conda ─────────────────────
+      #    Intel officially maintains these packages on the 'intel' conda channel.
+      #    This avoids having to download the full oneAPI installer (~30GB offline).
+      - name: Install Intel oneAPI via conda
+        shell: bash -l {0}
         run: |
-          # Network installer — downloads only selected components (~3-5 GB)
-          $installerUrl = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/7dff44ba-e3af-4448-841c-0d616ba5eb50/intel-oneapi-base-toolkit-2025.0.0.885_offline.exe"
-          $installer = "$env:TEMP\oneapi_installer.exe"
+          conda install -y \
+            -c https://software.repos.intel.com/python/conda/ \
+            -c conda-forge \
+            dpcpp_impl_win-64 \
+            mkl-devel \
+            tbb-devel
+          echo "Installed packages:"
+          conda list | grep -E "dpcpp|mkl|tbb"
+          echo "---"
+          # Find icx compiler location
+          ICX=$(find "$CONDA_PREFIX" -name "icx.exe" 2>/dev/null | head -1)
+          echo "ICX compiler: $ICX"
+          echo "CONDA_PREFIX=$CONDA_PREFIX" >> $GITHUB_ENV
+          echo "ICX_PATH=$ICX" >> $GITHUB_ENV
 
-          Write-Host "Downloading Intel oneAPI installer..."
-          $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest -Uri $installerUrl -OutFile $installer
-
-          $components = "intel.oneapi.win.dpcpp-compiler:intel.oneapi.win.mkl.devel:intel.oneapi.win.tbb.devel"
-          Write-Host "Installing components: $components"
-
-          $proc = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
-            "-s", "-a", "--silent", "--eula", "accept",
-            "--components", $components
-
-          if ($proc.ExitCode -notin @(0, 3010)) {
-            Write-Error "oneAPI installer exited with code $($proc.ExitCode)"
-            exit 1
-          }
-          Write-Host "oneAPI installation complete."
-
-      # ── 5. Set up MSVC (needed by icx on Windows) ─────────────────────────
+      # ── 5. Set up MSVC (required by icx on Windows for link step) ─────────
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -113,38 +108,58 @@ jobs:
         shell: pwsh
         run: |
           choco install cmake ninja --no-progress -y
-          # Refresh PATH
-          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + $env:PATH
+          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";$env:PATH"
           cmake --version
           ninja --version
 
       # ── 7. Configure CMake with SYCL ──────────────────────────────────────
       - name: Configure llama.cpp (SYCL backend)
-        shell: cmd
+        shell: pwsh
         run: |
-          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
-          if errorlevel 1 (
-            echo ERROR: Failed to activate oneAPI environment
-            exit /b 1
-          )
-          icx --version
-          cmake -S llama_cpp_src -B llama_cpp_src\build ^
-            -G Ninja ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DGGML_SYCL=ON ^
-            -DCMAKE_C_COMPILER=icx ^
-            -DCMAKE_CXX_COMPILER=icx ^
-            -DGGML_SYCL_F16=ON ^
-            -DBUILD_SHARED_LIBS=ON ^
-            -DLLAMA_BUILD_TESTS=OFF ^
-            -DLLAMA_BUILD_EXAMPLES=ON
+          $condaPrefix = $env:CONDA_PREFIX
+          Write-Host "CONDA_PREFIX: $condaPrefix"
+
+          # Locate icx.exe in the conda environment
+          $icx = Get-ChildItem -Path $condaPrefix -Filter "icx.exe" -Recurse -ErrorAction SilentlyContinue |
+                 Select-Object -First 1 -ExpandProperty FullName
+          if (-not $icx) {
+            # Fallback: check well-known conda paths
+            $candidates = @(
+              "$condaPrefix\Library\bin\icx.exe",
+              "$condaPrefix\bin\icx.exe",
+              "$condaPrefix\Scripts\icx.exe"
+            )
+            $icx = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $icx) {
+            Write-Error "icx.exe not found in conda environment. Conda install may have failed."
+            exit 1
+          }
+          Write-Host "Using compiler: $icx"
+          & $icx --version
+
+          # Set paths for MKL and TBB (conda layout: headers in Library/include, libs in Library/lib)
+          $mklRoot = "$condaPrefix\Library"
+          $tbbRoot = "$condaPrefix\Library"
+
+          cmake -S llama_cpp_src -B llama_cpp_src\build `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DGGML_SYCL=ON `
+            "-DCMAKE_C_COMPILER=$icx" `
+            "-DCMAKE_CXX_COMPILER=$icx" `
+            -DGGML_SYCL_F16=ON `
+            -DBUILD_SHARED_LIBS=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=ON `
+            "-DMKL_ROOT=$mklRoot" `
+            "-DTBB_ROOT=$tbbRoot"
 
       # ── 8. Build ───────────────────────────────────────────────────────────
       - name: Build llama.cpp
-        shell: cmd
+        shell: pwsh
         run: |
-          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
-          cmake --build llama_cpp_src\build --config Release -j %NUMBER_OF_PROCESSORS%
+          cmake --build llama_cpp_src\build --config Release -j $env:NUMBER_OF_PROCESSORS
 
       # ── 9. Package ─────────────────────────────────────────────────────────
       - name: Package release
@@ -170,13 +185,16 @@ jobs:
             ForEach-Object { Write-Host "  DLL: $($_.Name)"; Copy-Item $_.FullName $out }
 
           # Collect required Intel runtime DLLs
+          # With conda install, DLLs are in $CONDA_PREFIX\Library\bin
+          $condaPrefix = $env:CONDA_PREFIX
           $oneapiSearchPaths = @(
+            "$condaPrefix\Library\bin",
+            "$condaPrefix\bin",
+            "$condaPrefix\Library\lib",
+            # Also check traditional oneAPI paths as fallback
             "C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin",
-            "C:\Program Files (x86)\Intel\oneAPI\compiler\latest\windows\bin",
             "C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin",
-            "C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin\intel64",
-            "C:\Program Files (x86)\Intel\oneAPI\tbb\latest\bin",
-            "C:\Program Files (x86)\Intel\oneAPI\tbb\latest\bin\intel64\vc14"
+            "C:\Program Files (x86)\Intel\oneAPI\tbb\latest\bin"
           )
           $dllPatterns = @(
             "sycl?.dll","sycl??.dll","OpenCL.dll",
