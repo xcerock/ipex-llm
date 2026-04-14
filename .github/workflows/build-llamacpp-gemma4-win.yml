@@ -119,29 +119,53 @@ jobs:
           $condaPrefix = $env:CONDA_PREFIX
           Write-Host "CONDA_PREFIX: $condaPrefix"
 
-          # Locate icx.exe in the conda environment
-          $icx = Get-ChildItem -Path $condaPrefix -Filter "icx.exe" -Recurse -ErrorAction SilentlyContinue |
-                 Select-Object -First 1 -ExpandProperty FullName
-          if (-not $icx) {
-            # Fallback: check well-known conda paths
-            $candidates = @(
-              "$condaPrefix\Library\bin\icx.exe",
-              "$condaPrefix\bin\icx.exe",
-              "$condaPrefix\Scripts\icx.exe"
-            )
-            $icx = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          # Locate icx.exe
+          $icx = "$condaPrefix\Library\bin\icx.exe"
+          if (-not (Test-Path $icx)) {
+            $icx = Get-ChildItem -Path $condaPrefix -Filter "icx.exe" -Recurse -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
           }
           if (-not $icx) {
-            Write-Error "icx.exe not found in conda environment. Conda install may have failed."
+            Write-Error "icx.exe not found in conda environment."
             exit 1
           }
-          Write-Host "Using compiler: $icx"
+          Write-Host "Compiler: $icx"
           & $icx --version
 
-          # Set paths for MKL and TBB (conda layout: headers in Library/include, libs in Library/lib)
-          $mklRoot = "$condaPrefix\Library"
-          $tbbRoot = "$condaPrefix\Library"
+          # ── Fix: libircmt.lib not on linker search path ──────────────────
+          # dpcpp_impl_win-64 places Intel runtime libs relative to icx.exe.
+          # The linker (invoked by icx) needs to find libircmt.lib.
+          # Search the conda env for it and add its directory to LIB.
+          Write-Host "Searching for libircmt.lib..."
+          $libircmt = Get-ChildItem -Path $condaPrefix -Filter "libircmt.lib" -Recurse `
+                      -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($libircmt) {
+            $intelLibDir = $libircmt.DirectoryName
+            Write-Host "Found libircmt.lib at: $intelLibDir"
+            $env:LIB = "$intelLibDir;$env:LIB"
+          } else {
+            Write-Host "libircmt.lib not found by search — adding candidate Intel lib dirs to LIB..."
+            # icx.exe is at: Library\bin\icx.exe (from output)
+            # Runtime libs are typically at: Library\bin\compiler\lib  OR  Library\lib
+            $icxBin = Split-Path $icx -Parent                        # ..\Library\bin
+            $candidates = @(
+              "$icxBin\compiler\lib",                                 # Library\bin\compiler\lib
+              (Join-Path (Split-Path $icxBin -Parent) "lib"),         # Library\lib
+              "$condaPrefix\Library\compiler\lib"
+            )
+            foreach ($dir in $candidates) {
+              if (Test-Path $dir) {
+                Write-Host "  + $dir"
+                $env:LIB = "$dir;$env:LIB"
+              }
+            }
+          }
 
+          # Print first few entries in LIB so we can diagnose if needed
+          Write-Host "LIB (first 5 dirs):"
+          ($env:LIB -split ";") | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
+
+          # ── Run CMake ────────────────────────────────────────────────────
           cmake -S llama_cpp_src -B llama_cpp_src\build `
             -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
@@ -152,8 +176,8 @@ jobs:
             -DBUILD_SHARED_LIBS=ON `
             -DLLAMA_BUILD_TESTS=OFF `
             -DLLAMA_BUILD_EXAMPLES=ON `
-            "-DMKL_ROOT=$mklRoot" `
-            "-DTBB_ROOT=$tbbRoot"
+            "-DMKL_ROOT=$condaPrefix\Library" `
+            "-DTBB_ROOT=$condaPrefix\Library"
 
       # ── 8. Build ───────────────────────────────────────────────────────────
       - name: Build llama.cpp
