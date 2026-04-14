@@ -1,23 +1,15 @@
 name: Build llama.cpp with Gemma 4 support (Windows + Intel SYCL)
 
-# This workflow builds llama.cpp binaries with Intel SYCL backend for Windows.
-# It produces a portable ZIP similar to llama-cpp-ipex-llm releases but with
-# Gemma 4 (gemma4 architecture) support enabled via the latest upstream llama.cpp.
-#
-# Background: ipex-llm 2.2.0 is based on llama.cpp commit d7cfe1f which predates
-# Gemma 4 support. This workflow uses a newer llama.cpp that includes the gemma4
-# architecture, allowing models like gemma-4-E4B-it-Q4_K_M.gguf to run on Intel GPUs.
-
 on:
   workflow_dispatch:
     inputs:
       llama_cpp_ref:
-        description: 'llama.cpp branch, tag, or commit SHA to build from'
+        description: 'llama.cpp branch/tag/commit (default: master)'
         default: 'master'
         required: false
         type: string
       release_tag:
-        description: 'Tag name for the release (e.g. v2.3.0-gemma4). Leave empty to only upload artifact.'
+        description: 'GitHub release tag (e.g. v2.3.0-gemma4). Empty = artifact only.'
         default: ''
         required: false
         type: string
@@ -33,118 +25,111 @@ jobs:
     name: Build Windows SYCL binaries
     runs-on: windows-2022
     timeout-minutes: 120
+    env:
+      LLAMA_CPP_COMMIT: ''
+      ZIP_NAME: ''
 
     steps:
-      # ─────────────────────────────────────────────
-      # 1. Checkout this repository
-      # ─────────────────────────────────────────────
-      - name: Checkout fork_ipex-llm
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout xcerock/ipex-llm
         uses: actions/checkout@v4
 
-      # ─────────────────────────────────────────────
-      # 2. Clone llama.cpp at the specified ref
-      # ─────────────────────────────────────────────
+      # ── 2. Clone llama.cpp ─────────────────────────────────────────────────
       - name: Clone llama.cpp
-        shell: bash
+        shell: pwsh
         run: |
-          REF="${{ github.event.inputs.llama_cpp_ref || 'master' }}"
-          echo "Cloning llama.cpp @ ${REF}"
-          git clone --depth=1 --branch "${REF}" \
-            https://github.com/ggml-org/llama.cpp.git llama_cpp_src || \
-          git clone --depth=1 https://github.com/ggml-org/llama.cpp.git llama_cpp_src && \
-            cd llama_cpp_src && git checkout "${REF}"
+          $ref = "${{ github.event.inputs.llama_cpp_ref }}"
+          if (-not $ref) { $ref = "master" }
 
-          cd llama_cpp_src
-          COMMIT=$(git rev-parse --short HEAD)
-          echo "Building from llama.cpp commit: ${COMMIT}"
-          echo "LLAMA_CPP_COMMIT=${COMMIT}" >> $GITHUB_ENV
+          Write-Host "Cloning ggml-org/llama.cpp @ $ref ..."
+          git clone --depth=1 --branch $ref `
+            https://github.com/ggml-org/llama.cpp.git llama_cpp_src
 
-          # Verify gemma4 architecture is present in this version
-          if grep -r "gemma4" src/ --include="*.cpp" --include="*.h" -l 2>/dev/null | head -1; then
-            echo "GEMMA4_SUPPORTED=true" >> $GITHUB_ENV
-            echo "✓ gemma4 architecture found in this llama.cpp version"
-          else
-            echo "GEMMA4_SUPPORTED=false" >> $GITHUB_ENV
-            echo "⚠ gemma4 architecture NOT found in this commit — try a newer ref"
-          fi
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Branch '$ref' not found, cloning default branch then checking out..."
+            git clone --depth=1 https://github.com/ggml-org/llama.cpp.git llama_cpp_src
+            Set-Location llama_cpp_src
+            git fetch --depth=1 origin $ref
+            git checkout $ref
+            Set-Location ..
+          }
 
-      # ─────────────────────────────────────────────
-      # 3. Cache Intel oneAPI installation
-      # ─────────────────────────────────────────────
-      - name: Cache Intel oneAPI
+          $commit = (git -C llama_cpp_src rev-parse --short HEAD)
+          Write-Host "llama.cpp commit: $commit"
+          "LLAMA_CPP_COMMIT=$commit" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Verify gemma4 support is present
+          $found = Select-String -Path "llama_cpp_src\src\*.cpp" -Pattern "gemma4" -Quiet 2>$null
+          if ($found) {
+            Write-Host "OK: gemma4 architecture found in this llama.cpp version"
+            "GEMMA4_OK=true" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            Write-Warning "gemma4 NOT found — try a newer commit. Build will continue anyway."
+            "GEMMA4_OK=false" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      # ── 3. Cache Intel oneAPI ──────────────────────────────────────────────
+      - name: Cache Intel oneAPI installation
         id: cache-oneapi
         uses: actions/cache@v4
         with:
-          path: C:\Program Files (x86)\Intel\oneAPI
-          key: oneapi-2025.0-dpcpp-mkl-tbb-win
+          path: C:/Program Files (x86)/Intel/oneAPI
+          key: oneapi-2025.0-win-dpcpp-mkl-tbb-v1
 
-      # ─────────────────────────────────────────────
-      # 4. Install Intel oneAPI (DPC++, MKL, TBB)
-      #    Only runs if not cached.
-      # ─────────────────────────────────────────────
-      - name: Install Intel oneAPI Base Toolkit (minimal)
+      # ── 4. Install Intel oneAPI (only on cache miss) ───────────────────────
+      - name: Install Intel oneAPI minimal components
         if: steps.cache-oneapi.outputs.cache-hit != 'true'
-        shell: powershell
+        shell: pwsh
         run: |
-          Write-Host "Downloading Intel oneAPI network installer..."
-          $installerUrl = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/96aa5993-5b22-4a9b-91ab-da679f422594/intel-oneapi-base-toolkit-2025.0.1.47_offline.exe"
-
-          # Fallback: use the online installer with component selection
-          $networkInstallerUrl = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/intel-oneapi-base-toolkit-2025.0-windows.exe"
-
-          $components = @(
-            "intel.oneapi.win.dpcpp-compiler",
-            "intel.oneapi.win.mkl.devel",
-            "intel.oneapi.win.tbb.devel"
-          ) -join ":"
-
+          # Network installer — downloads only selected components (~3-5 GB)
+          $installerUrl = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/7dff44ba-e3af-4448-841c-0d616ba5eb50/intel-oneapi-base-toolkit-2025.0.0.885_offline.exe"
           $installer = "$env:TEMP\oneapi_installer.exe"
 
-          try {
-            Write-Host "Attempting offline installer download..."
-            Invoke-WebRequest -Uri $installerUrl -OutFile $installer -TimeoutSec 300
-          } catch {
-            Write-Host "Offline installer failed, trying network installer..."
-            Invoke-WebRequest -Uri $networkInstallerUrl -OutFile $installer -TimeoutSec 120
+          Write-Host "Downloading Intel oneAPI installer..."
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $installerUrl -OutFile $installer
+
+          $components = "intel.oneapi.win.dpcpp-compiler:intel.oneapi.win.mkl.devel:intel.oneapi.win.tbb.devel"
+          Write-Host "Installing components: $components"
+
+          $proc = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList `
+            "-s", "-a", "--silent", "--eula", "accept",
+            "--components", $components
+
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            Write-Error "oneAPI installer exited with code $($proc.ExitCode)"
+            exit 1
           }
-
-          Write-Host "Installing Intel oneAPI components: $components"
-          Start-Process -FilePath $installer -ArgumentList @(
-            "-s", "--eula", "accept",
-            "--components", $components,
-            "--install-dir", "C:\Program Files (x86)\Intel\oneAPI",
-            "-a", "--silent", "--cli"
-          ) -Wait -NoNewWindow
-
           Write-Host "oneAPI installation complete."
 
-      # Alternative: Use Chocolatey (faster but may have older versions)
-      # - name: Install Intel oneAPI via Chocolatey
-      #   run: choco install intel-oneapi-dpcpp-compiler intel-oneapi-mkl -y
+      # ── 5. Set up MSVC (needed by icx on Windows) ─────────────────────────
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-      # ─────────────────────────────────────────────
-      # 5. Verify oneAPI installation
-      # ─────────────────────────────────────────────
-      - name: Verify oneAPI environment
-        shell: cmd
+      # ── 6. Install CMake and Ninja ─────────────────────────────────────────
+      - name: Install CMake and Ninja
+        shell: pwsh
         run: |
-          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 2>&1
-          echo --- Compiler version ---
-          icx --version
-          echo --- Available SYCL devices ---
-          sycl-ls 2>nul || echo "(sycl-ls not available in build env)"
+          choco install cmake ninja --no-progress -y
+          # Refresh PATH
+          $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH","Machine") + ";" + $env:PATH
+          cmake --version
+          ninja --version
 
-      # ─────────────────────────────────────────────
-      # 6. Configure CMake with Intel SYCL backend
-      # ─────────────────────────────────────────────
-      - name: Configure llama.cpp with SYCL
+      # ── 7. Configure CMake with SYCL ──────────────────────────────────────
+      - name: Configure llama.cpp (SYCL backend)
         shell: cmd
         run: |
           call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
-
-          cd llama_cpp_src
-          cmake -B build ^
-            -G "Ninja" ^
+          if errorlevel 1 (
+            echo ERROR: Failed to activate oneAPI environment
+            exit /b 1
+          )
+          icx --version
+          cmake -S llama_cpp_src -B llama_cpp_src\build ^
+            -G Ninja ^
             -DCMAKE_BUILD_TYPE=Release ^
             -DGGML_SYCL=ON ^
             -DCMAKE_C_COMPILER=icx ^
@@ -154,135 +139,106 @@ jobs:
             -DLLAMA_BUILD_TESTS=OFF ^
             -DLLAMA_BUILD_EXAMPLES=ON
 
-      # ─────────────────────────────────────────────
-      # 7. Build
-      # ─────────────────────────────────────────────
+      # ── 8. Build ───────────────────────────────────────────────────────────
       - name: Build llama.cpp
         shell: cmd
         run: |
           call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
-          cd llama_cpp_src
-          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS%
+          cmake --build llama_cpp_src\build --config Release -j %NUMBER_OF_PROCESSORS%
 
-      # ─────────────────────────────────────────────
-      # 8. Package binaries and required DLLs
-      # ─────────────────────────────────────────────
-      - name: Package release ZIP
-        shell: powershell
+      # ── 9. Package ─────────────────────────────────────────────────────────
+      - name: Package release
+        shell: pwsh
         run: |
-          $releaseDir = "release-win"
-          New-Item -ItemType Directory -Path $releaseDir -Force
+          $out = "release-win"
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
 
-          $buildDir = "llama_cpp_src\build\bin\Release"
-          if (-not (Test-Path $buildDir)) {
-            $buildDir = "llama_cpp_src\build\bin"
-          }
-          if (-not (Test-Path $buildDir)) {
-            $buildDir = "llama_cpp_src\build"
-          }
+          # Find the bin directory (layout varies by llama.cpp version)
+          $binCandidates = @(
+            "llama_cpp_src\build\bin\Release",
+            "llama_cpp_src\build\bin",
+            "llama_cpp_src\build"
+          )
+          $binDir = $binCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          Write-Host "Copying binaries from: $binDir"
 
-          Write-Host "Copying EXEs from: $buildDir"
-          Get-ChildItem $buildDir -Filter "*.exe" | Where-Object {
-            $_.Name -notmatch "test-"
-          } | ForEach-Object {
-            Write-Host "  + $($_.Name)"
-            Copy-Item $_.FullName $releaseDir
-          }
+          Get-ChildItem $binDir -Filter "*.exe" |
+            Where-Object { $_.Name -notmatch "^(test-|llama-test)" } |
+            ForEach-Object { Write-Host "  EXE: $($_.Name)"; Copy-Item $_.FullName $out }
 
-          Write-Host "Copying DLLs from build..."
-          Get-ChildItem $buildDir -Filter "*.dll" | ForEach-Object {
-            Write-Host "  + $($_.Name)"
-            Copy-Item $_.FullName $releaseDir
-          }
+          Get-ChildItem $binDir -Filter "*.dll" |
+            ForEach-Object { Write-Host "  DLL: $($_.Name)"; Copy-Item $_.FullName $out }
 
-          # Copy Intel oneAPI runtime DLLs needed for SYCL execution
-          $oneapiRoots = @(
+          # Collect required Intel runtime DLLs
+          $oneapiSearchPaths = @(
             "C:\Program Files (x86)\Intel\oneAPI\compiler\latest\bin",
+            "C:\Program Files (x86)\Intel\oneAPI\compiler\latest\windows\bin",
             "C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin",
-            "C:\Program Files (x86)\Intel\oneAPI\tbb\latest\bin\intel64\vc14",
-            "C:\Program Files (x86)\Intel\oneAPI\tbb\latest\bin\intel64",
-            "C:\Windows\System32"
+            "C:\Program Files (x86)\Intel\oneAPI\mkl\latest\bin\intel64",
+            "C:\Program Files (x86)\Intel\oneAPI\tbb\latest\bin",
+            "C:\Program Files (x86)\Intel\oneAPI\tbb\latest\bin\intel64\vc14"
           )
-
-          $requiredDlls = @(
-            "sycl?.dll", "sycl??.dll",
-            "OpenCL.dll",
-            "ur_loader.dll",
-            "ur_adapter_level_zero.dll",
-            "ur_adapter_opencl.dll",
-            "ur_win_proxy_loader.dll",
-            "mkl_core.*.dll",
-            "mkl_sycl_blas.*.dll",
-            "mkl_tbb_thread.*.dll",
-            "tbb12.dll",
-            "tbbmalloc.dll",
-            "dnnl.dll",
-            "libiomp5md.dll",
-            "libmmd.dll",
-            "svml_dispmd.dll"
+          $dllPatterns = @(
+            "sycl?.dll","sycl??.dll","OpenCL.dll",
+            "ur_loader.dll","ur_adapter_level_zero.dll","ur_adapter_opencl.dll","ur_win_proxy_loader.dll",
+            "mkl_core.*.dll","mkl_sycl_blas.*.dll","mkl_tbb_thread.*.dll",
+            "tbb12.dll","tbbmalloc.dll","dnnl.dll",
+            "libiomp5md.dll","libmmd.dll","svml_dispmd.dll"
           )
-
-          foreach ($root in $oneapiRoots) {
-            if (Test-Path $root) {
-              foreach ($pattern in $requiredDlls) {
-                $found = Get-ChildItem $root -Filter $pattern -ErrorAction SilentlyContinue
-                foreach ($f in $found) {
-                  if (-not (Test-Path "$releaseDir\$($f.Name)")) {
-                    Write-Host "  [oneAPI] + $($f.Name)"
-                    Copy-Item $f.FullName $releaseDir
-                  }
+          foreach ($dir in $oneapiSearchPaths) {
+            if (-not (Test-Path $dir)) { continue }
+            foreach ($pat in $dllPatterns) {
+              Get-ChildItem $dir -Filter $pat -ErrorAction SilentlyContinue | ForEach-Object {
+                if (-not (Test-Path "$out\$($_.Name)")) {
+                  Write-Host "  [oneAPI] $($_.Name)"
+                  Copy-Item $_.FullName $out
                 }
               }
             }
           }
 
-          # Write README
+          # README
           $commit = $env:LLAMA_CPP_COMMIT
-          $buildDate = Get-Date -Format "yyyy-MM-dd"
-          $readme = @"
-          llama.cpp for Intel GPU (Windows) — with Gemma 4 support
-          ============================================================
-          Built from: https://github.com/ggml-org/llama.cpp @ ${commit}
-          Build date: ${buildDate}
-          Intel SYCL backend: enabled
-          Gemma 4 (gemma4 architecture): supported
+          $lines = @(
+            "llama.cpp for Intel GPU (Windows) - Gemma 4 support",
+            "=====================================================",
+            "Built from : https://github.com/ggml-org/llama.cpp @ $commit",
+            "SYCL backend : enabled",
+            "Gemma 4 (gemma4 arch) : supported",
+            "",
+            "QUICK START",
+            "-----------",
+            "1. Open Command Prompt, cd to this folder",
+            "2. set SYCL_CACHE_PERSISTENT=1",
+            "3. llama-cli.exe -m gemma-4-E4B-it-Q4_K_M.gguf -n 256 --prompt `"What is AI?`" -ngl 99",
+            "",
+            "OPTIONAL",
+            "--------",
+            "set SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1  (may improve performance)",
+            "set ONEAPI_DEVICE_SELECTOR=level_zero:0               (single GPU)",
+            "",
+            "REQUIREMENTS",
+            "------------",
+            "- Intel Arc / Iris Xe GPU",
+            "- Intel GPU driver >= 31.0.101.5522",
+            "  https://www.intel.com/content/www/us/en/download/785597"
+          )
+          $lines | Out-File "$out\README.txt" -Encoding utf8
 
-          QUICK START
-          -----------
-          1. Set environment:
-             set SYCL_CACHE_PERSISTENT=1
+          Write-Host "`nPackage contents ($((Get-ChildItem $out).Count) files):"
+          Get-ChildItem $out | Format-Table Name, @{N='Size(KB)';E={[int]($_.Length/1KB)}} -AutoSize
 
-          2. Run Gemma 4 (text-only GGUF):
-             llama-cli.exe -m gemma-4-E4B-it-Q4_K_M.gguf -n 256 --prompt "What is AI?" -ngl 99
-
-          3. Optional performance boost:
-             set SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=1
-
-          NOTES
-          -----
-          - Built to add Gemma 4 support that was missing in ipex-llm 2.2.0
-          - Requires Intel GPU driver >= 31.0.101.5522
-          - For multi-GPU: set ONEAPI_DEVICE_SELECTOR=level_zero:0
-          "@
-          $readme | Out-File "$releaseDir\README.txt" -Encoding utf8
-
-          Write-Host "`nRelease package contents:"
-          Get-ChildItem $releaseDir | Format-Table Name, Length -AutoSize
-
-      # ─────────────────────────────────────────────
-      # 9. Create ZIP archive
-      # ─────────────────────────────────────────────
-      - name: Create ZIP archive
-        shell: powershell
+      # ── 10. Zip ────────────────────────────────────────────────────────────
+      - name: Create ZIP
+        shell: pwsh
         run: |
-          $zipName = "llama-cpp-gemma4-win-${{ env.LLAMA_CPP_COMMIT }}.zip"
-          Compress-Archive -Path "release-win\*" -DestinationPath $zipName
-          Write-Host "Created: $zipName ($('{0:N0}' -f (Get-Item $zipName).Length) bytes)"
-          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+          $zip = "llama-cpp-gemma4-win-${{ env.LLAMA_CPP_COMMIT }}.zip"
+          Compress-Archive -Path "release-win\*" -DestinationPath $zip -Force
+          $sizeMB = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          Write-Host "Created $zip ($sizeMB MB)"
+          "ZIP_NAME=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # ─────────────────────────────────────────────
-      # 10. Upload as GitHub Actions artifact
-      # ─────────────────────────────────────────────
+      # ── 11. Upload artifact ────────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -290,34 +246,27 @@ jobs:
           path: ${{ env.ZIP_NAME }}
           retention-days: 30
 
-      # ─────────────────────────────────────────────
-      # 11. Create GitHub Release (only if tag input given)
-      # ─────────────────────────────────────────────
+      # ── 12. Create GitHub Release (optional) ──────────────────────────────
       - name: Create GitHub Release
         if: ${{ github.event.inputs.release_tag != '' || startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag || github.ref_name }}
-          name: "llama.cpp for Intel GPU — Gemma 4 support (${{ env.LLAMA_CPP_COMMIT }})"
+          name: "llama.cpp Intel GPU — Gemma 4 (${{ env.LLAMA_CPP_COMMIT }})"
           body: |
-            ## llama.cpp Windows release with Gemma 4 support
+            ## llama.cpp Windows portable ZIP with Gemma 4 support
 
-            This release adds support for the `gemma4` GGUF architecture (Gemma 4 models),
-            which was missing in ipex-llm 2.2.0 (based on llama.cpp commit `d7cfe1f`).
+            ipex-llm 2.2.0 is based on llama.cpp `d7cfe1f` which predates Gemma 4.
+            This release uses a newer llama.cpp that supports the `gemma4` GGUF architecture.
 
-            **Built from:** ggml-org/llama.cpp @ `${{ env.LLAMA_CPP_COMMIT }}`
+            **llama.cpp commit:** `${{ env.LLAMA_CPP_COMMIT }}`
             **Intel SYCL backend:** enabled
-            **Gemma 4 support:** ✓
+            **Gemma 4:** supported
 
             ### Usage
             ```cmd
             set SYCL_CACHE_PERSISTENT=1
             llama-cli.exe -m gemma-4-E4B-it-Q4_K_M.gguf -n 256 --prompt "What is AI?" -ngl 99
             ```
-
-            ### Requirements
-            - Intel GPU (Arc, Iris Xe, or newer)
-            - Intel GPU driver >= 31.0.101.5522
           files: ${{ env.ZIP_NAME }}
-          draft: false
           prerelease: true
