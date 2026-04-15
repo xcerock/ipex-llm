@@ -439,12 +439,20 @@ jobs:
           }
 
           # ── Run CMake ────────────────────────────────────────────────────
+          # -mno-avx512f: prevent icx from generating AVX-512 instructions.
+          # The GitHub Actions runner CPU may support AVX-512 (Azure Xeon),
+          # but user CPUs like Meteor Lake (Core Ultra 7 155H) do not.
+          # icx ignores /arch:AVX2 for its own auto-vectorization and may
+          # silently emit AVX-512 code, causing STATUS_ILLEGAL_INSTRUCTION
+          # at runtime. -mno-avx512f explicitly disables this.
           cmake -S llama_cpp_src -B llama_cpp_src\build `
             -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DGGML_SYCL=ON `
             "-DCMAKE_C_COMPILER=$icx" `
             "-DCMAKE_CXX_COMPILER=$icx" `
+            "-DCMAKE_C_FLAGS=-mno-avx512f -mno-avx512vl -mno-avx512bw -mno-avx512cd -mno-avx512vnni" `
+            "-DCMAKE_CXX_FLAGS=-mno-avx512f -mno-avx512vl -mno-avx512bw -mno-avx512cd -mno-avx512vnni" `
             -DGGML_SYCL_F16=ON `
             -DBUILD_SHARED_LIBS=ON `
             -DLLAMA_BUILD_TESTS=OFF `
@@ -498,8 +506,26 @@ jobs:
             "ur_loader.dll","ur_adapter_level_zero.dll","ur_adapter_opencl.dll","ur_win_proxy_loader.dll",
             "mkl_core.*.dll","mkl_sycl_blas.*.dll","mkl_tbb_thread.*.dll",
             "tbb12.dll","tbbmalloc.dll","dnnl.dll",
-            "libiomp5md.dll","libmmd.dll","svml_dispmd.dll"
+            "libiomp5md.dll","libmmd.dll","svml_dispmd.dll","irc_msg.dll"
           )
+          # Also collect OpenSSL DLLs (llama.cpp links against OpenSSL for HTTPS)
+          $opensslPaths = @(
+            "C:\Program Files\OpenSSL\bin",
+            "C:\Program Files\OpenSSL-Win64\bin",
+            "$condaPrefix\Library\bin",
+            "$condaPrefix\bin"
+          )
+          foreach ($dir in $opensslPaths) {
+            if (-not (Test-Path $dir)) { continue }
+            foreach ($pat in @("libcrypto*.dll","libssl*.dll")) {
+              Get-ChildItem $dir -Filter $pat -ErrorAction SilentlyContinue | ForEach-Object {
+                if (-not (Test-Path "$out\$($_.Name)")) {
+                  Write-Host "  [OpenSSL] $($_.Name)"
+                  Copy-Item $_.FullName $out
+                }
+              }
+            }
+          }
           foreach ($dir in $oneapiSearchPaths) {
             if (-not (Test-Path $dir)) { continue }
             foreach ($pat in $dllPatterns) {
