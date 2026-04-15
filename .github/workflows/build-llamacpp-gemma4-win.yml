@@ -226,6 +226,13 @@ jobs:
           Write-Host "LIB (first 5 dirs):"
           ($env:LIB -split ";") | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
 
+          # Persist LIB to subsequent steps.
+          # $env:LIB changes only survive for this PowerShell step; the Build step
+          # would start a new process with the original LIB (missing Intel lib dir).
+          # Writing to $GITHUB_ENV makes the value available to all later steps.
+          "LIB=$($env:LIB)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "LIB persisted to GITHUB_ENV for subsequent steps"
+
           # Set ONEAPI_ROOT so cmake recognises this as a proper Intel installation
           # (without it, cmake warns "Using open-source SYCL compiler" and may skip
           # oneAPI-specific MKL search paths)
