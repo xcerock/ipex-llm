@@ -82,22 +82,80 @@ jobs:
       - name: Install Intel oneAPI via conda
         shell: bash -l {0}
         run: |
+          # dpcpp_impl_win-64   → icx.exe compiler
+          # mkl-devel           → MKL headers + classic (CPU) import libs
+          # mkl-dpcpp           → MKL SYCL BLAS component (mkl_sycl_blas.dll)
+          # tbb-devel           → TBB
           conda install -y \
             -c https://software.repos.intel.com/python/conda/ \
             -c conda-forge \
             dpcpp_impl_win-64 \
             mkl-devel \
+            mkl-dpcpp \
             tbb-devel
           echo "Installed packages:"
           conda list | grep -E "dpcpp|mkl|tbb"
           echo "---"
-          # Find icx compiler location
+          # Report whether mkl_sycl_blas.dll is now present
+          if find "$CONDA_PREFIX" -name "mkl_sycl_blas*.dll" 2>/dev/null | grep -q .; then
+            echo "OK: mkl_sycl_blas found"
+          else
+            echo "WARNING: mkl_sycl_blas.dll still absent — cmake will be patched"
+          fi
           ICX=$(find "$CONDA_PREFIX" -name "icx.exe" 2>/dev/null | head -1)
           echo "ICX compiler: $ICX"
           echo "CONDA_PREFIX=$CONDA_PREFIX" >> $GITHUB_ENV
           echo "ICX_PATH=$ICX" >> $GITHUB_ENV
 
-      # ── 5. Set up MSVC (required by icx on Windows for link step) ─────────
+      # ── 5. Patch llama.cpp cmake: make MKL SYCL targets optional ─────────
+      #    mkl_sycl_blas is not in the conda mkl-devel package (it requires
+      #    the full oneAPI installer). We patch ggml-sycl/CMakeLists.txt to
+      #    wrap any unconditional use of MKL::MKL_SYCL::* in if(TARGET ...).
+      #    This allows the build to succeed with CPU-SYCL fallback paths.
+      - name: Patch llama.cpp cmake for optional MKL SYCL
+        shell: pwsh
+        run: |
+          $file = "llama_cpp_src\ggml\src\ggml-sycl\CMakeLists.txt"
+          if (-not (Test-Path $file)) {
+            Write-Warning "ggml-sycl CMakeLists.txt not found — skipping patch"
+            exit 0
+          }
+
+          # Check if mkl_sycl_blas.dll already exists in the conda env
+          $condaPrefix = $env:CONDA_PREFIX
+          $syclBlas = Get-ChildItem $condaPrefix -Recurse -Filter "mkl_sycl_blas*.dll" `
+                      -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($syclBlas) {
+            Write-Host "mkl_sycl_blas found at $($syclBlas.FullName) — no cmake patch needed"
+            exit 0
+          }
+
+          Write-Host "mkl_sycl_blas not found — patching cmake to make MKL::MKL_SYCL::* optional"
+          $lines = Get-Content $file
+          $out   = [System.Collections.Generic.List[string]]::new()
+          foreach ($line in $lines) {
+            # Match any target_link_libraries call that references MKL::MKL_SYCL::
+            if ($line -match 'target_link_libraries\b.*MKL::MKL_SYCL::(\w+)') {
+              $target = "MKL::MKL_SYCL::$($Matches[1])"
+              Write-Host "  Wrapping: $target"
+              $out.Add("if(TARGET $target)")
+              $out.Add($line)
+              $out.Add("endif()")
+            } else {
+              $out.Add($line)
+            }
+          }
+          $out | Set-Content $file -Encoding UTF8
+          Write-Host "Patch applied ($($out.Count) lines)."
+
+          # Also disable any compile definition that gates MKL SYCL code paths
+          # (prevents compile errors from unconditional #include of sycl_blas headers)
+          $content = Get-Content $file -Raw
+          if ($content -match 'GGML_SYCL_WARP_REDUCE_COPY') {
+            Write-Host "(no MKL SYCL compile definitions to remove)"
+          }
+
+      # ── 6. Set up MSVC (required by icx on Windows for link step) ─────────
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -164,6 +222,12 @@ jobs:
           # Print first few entries in LIB so we can diagnose if needed
           Write-Host "LIB (first 5 dirs):"
           ($env:LIB -split ";") | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
+
+          # Set ONEAPI_ROOT so cmake recognises this as a proper Intel installation
+          # (without it, cmake warns "Using open-source SYCL compiler" and may skip
+          # oneAPI-specific MKL search paths)
+          $env:ONEAPI_ROOT = "$condaPrefix\Library"
+          Write-Host "ONEAPI_ROOT=$($env:ONEAPI_ROOT)"
 
           # ── Run CMake ────────────────────────────────────────────────────
           cmake -S llama_cpp_src -B llama_cpp_src\build `
