@@ -86,7 +86,7 @@ jobs:
           # mkl-devel           → MKL headers + classic (CPU) import libs
           # mkl-dpcpp           → MKL SYCL BLAS component (mkl_sycl_blas.dll)
           # tbb-devel           → TBB
-          conda install -y \
+          conda install -y -c conda-forge opencl-headers \
             -c https://software.repos.intel.com/python/conda/ \
             -c conda-forge \
             dpcpp_impl_win-64 \
