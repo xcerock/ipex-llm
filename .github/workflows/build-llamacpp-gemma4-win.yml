@@ -91,11 +91,12 @@ jobs:
             -c conda-forge \
             dpcpp_impl_win-64 \
             dpcpp-cpp-rt \
+            opencl-headers \
             mkl-devel \
             mkl-dpcpp \
             tbb-devel
           echo "Installed packages:"
-          conda list | grep -E "dpcpp|mkl|tbb|unified"
+          conda list | grep -E "dpcpp|mkl|tbb|unified|opencl"
           echo "---"
           # Report whether mkl_sycl_blas.dll is now present
           if find "$CONDA_PREFIX" -name "mkl_sycl_blas*.dll" 2>/dev/null | grep -q .; then
@@ -271,6 +272,45 @@ jobs:
             }
           } else {
             Write-Host "ur_api.h already present at $syclInclude"
+          }
+
+          # ── Fix: CL/cl.h must be in the SYCL include path ────────────────
+          # sycl/detail/cl.h includes <CL/cl.h> (Khronos OpenCL headers).
+          # These come from the 'opencl-headers' conda-forge package.
+          # If still missing, download from KhronosGroup/OpenCL-Headers.
+          $clDir = "$syclInclude\CL"
+          if (-not (Test-Path "$clDir\cl.h")) {
+            Write-Host "CL/cl.h not found — searching conda prefix..."
+            $clFound = Get-ChildItem $condaPrefix -Recurse -Filter "cl.h" `
+                       -ErrorAction SilentlyContinue |
+                       Where-Object { $_.DirectoryName -match "\\CL$" } |
+                       Select-Object -First 1
+            if ($clFound) {
+              Write-Host "Found CL headers at $($clFound.DirectoryName) — copying directory"
+              New-Item -ItemType Directory -Path $clDir -Force | Out-Null
+              Get-ChildItem $clFound.DirectoryName | Copy-Item -Destination $clDir -Force
+            } else {
+              Write-Host "Not found in conda prefix — downloading KhronosGroup/OpenCL-Headers..."
+              $clHeaders = @("cl.h","cl_platform.h","cl_ext.h","cl_ext_intel.h",
+                             "cl_gl.h","cl_gl_ext.h","cl_d3d10.h","cl_d3d11.h",
+                             "cl_dx9_media_sharing.h","cl_dx9_media_sharing_intel.h",
+                             "cl_version.h","cl_icd.h")
+              $baseUrl = "https://raw.githubusercontent.com/KhronosGroup/OpenCL-Headers/main/CL"
+              New-Item -ItemType Directory -Path $clDir -Force | Out-Null
+              foreach ($h in $clHeaders) {
+                try {
+                  Invoke-WebRequest -Uri "$baseUrl/$h" -OutFile "$clDir\$h" -TimeoutSec 30 -ErrorAction SilentlyContinue
+                  Write-Host "  Downloaded $h"
+                } catch { Write-Host "  Skipped $h (not found)" }
+              }
+              if (Test-Path "$clDir\cl.h") {
+                Write-Host "Downloaded OpenCL headers to $clDir"
+              } else {
+                Write-Warning "Failed to obtain CL/cl.h — build may fail"
+              }
+            }
+          } else {
+            Write-Host "CL/cl.h already present at $clDir"
           }
 
           # Set ONEAPI_ROOT so cmake recognises this as a proper Intel installation
