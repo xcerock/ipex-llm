@@ -90,17 +90,25 @@ jobs:
             -c https://software.repos.intel.com/python/conda/ \
             -c conda-forge \
             dpcpp_impl_win-64 \
+            dpcpp-cpp-rt \
             mkl-devel \
             mkl-dpcpp \
             tbb-devel
           echo "Installed packages:"
-          conda list | grep -E "dpcpp|mkl|tbb"
+          conda list | grep -E "dpcpp|mkl|tbb|unified"
           echo "---"
           # Report whether mkl_sycl_blas.dll is now present
           if find "$CONDA_PREFIX" -name "mkl_sycl_blas*.dll" 2>/dev/null | grep -q .; then
             echo "OK: mkl_sycl_blas found"
           else
             echo "WARNING: mkl_sycl_blas.dll still absent — cmake will be patched"
+          fi
+          # Report whether ur_api.h is present (needed by sycl/buffer.hpp)
+          if find "$CONDA_PREFIX" -name "ur_api.h" 2>/dev/null | grep -q .; then
+            echo "OK: ur_api.h found"
+            find "$CONDA_PREFIX" -name "ur_api.h" 2>/dev/null
+          else
+            echo "WARNING: ur_api.h not found — configure step will download it"
           fi
           ICX=$(find "$CONDA_PREFIX" -name "icx.exe" 2>/dev/null | head -1)
           echo "ICX compiler: $ICX"
@@ -232,6 +240,38 @@ jobs:
           # Writing to $GITHUB_ENV makes the value available to all later steps.
           "LIB=$($env:LIB)" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "LIB persisted to GITHUB_ENV for subsequent steps"
+
+          # ── Fix: ur_api.h must be in the SYCL include path ───────────────
+          # sycl/buffer.hpp includes <ur_api.h> (for ur_native_handle_t).
+          # dpcpp_impl_win-64 may not install this Unified Runtime header;
+          # it might come from dpcpp-cpp-rt or be in a non-standard location.
+          # Strategy:
+          #   1. Check if it's already in Library\include (expected location)
+          #   2. Search the whole conda prefix for it and copy if found
+          #   3. Download from oneapi-src/unified-runtime as a last resort
+          $syclInclude = "$condaPrefix\Library\include"
+          if (-not (Test-Path "$syclInclude\ur_api.h")) {
+            Write-Host "ur_api.h not in $syclInclude — searching conda prefix..."
+            $urFound = Get-ChildItem $condaPrefix -Recurse -Filter "ur_api.h" `
+                       -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($urFound) {
+              Write-Host "Found at $($urFound.FullName) — copying to $syclInclude"
+              Copy-Item $urFound.FullName "$syclInclude\ur_api.h" -Force
+            } else {
+              Write-Host "Not found in conda prefix — downloading from oneapi-src/unified-runtime (main)..."
+              $urUrl = "https://raw.githubusercontent.com/oneapi-src/unified-runtime/main/include/ur_api.h"
+              try {
+                Invoke-WebRequest -Uri $urUrl -OutFile "$syclInclude\ur_api.h" -TimeoutSec 90
+                $kb = [int]((Get-Item "$syclInclude\ur_api.h").Length / 1KB)
+                Write-Host "Downloaded ur_api.h ($kb KB) to $syclInclude"
+              } catch {
+                Write-Warning "Download failed: $_"
+                Write-Warning "Build may fail — ur_api.h could not be obtained"
+              }
+            }
+          } else {
+            Write-Host "ur_api.h already present at $syclInclude"
+          }
 
           # Set ONEAPI_ROOT so cmake recognises this as a proper Intel installation
           # (without it, cmake warns "Using open-source SYCL compiler" and may skip
