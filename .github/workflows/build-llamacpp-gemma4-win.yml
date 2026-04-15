@@ -121,16 +121,19 @@ jobs:
             exit 0
           }
 
-          # Check if mkl_sycl_blas.dll already exists in the conda env
+          # Check if mkl_sycl_blas IMPORT LIBRARY (.lib) exists — the DLL alone is not enough.
+          # conda mkl-dpcpp ships the runtime DLL but NOT the .lib needed for the linker.
+          # We check for the .lib here; if absent the cmake patch is required.
           $condaPrefix = $env:CONDA_PREFIX
-          $syclBlas = Get-ChildItem $condaPrefix -Recurse -Filter "mkl_sycl_blas*.dll" `
-                      -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($syclBlas) {
-            Write-Host "mkl_sycl_blas found at $($syclBlas.FullName) — no cmake patch needed"
+          $syclBlasLib = Get-ChildItem "$condaPrefix\Library\lib" -Filter "mkl_sycl_blas*dll*.lib" `
+                         -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($syclBlasLib) {
+            Write-Host "mkl_sycl_blas import lib found at $($syclBlasLib.FullName) — no cmake patch needed"
             exit 0
           }
 
-          Write-Host "mkl_sycl_blas not found — patching cmake to make MKL::MKL_SYCL::* optional"
+          Write-Host "mkl_sycl_blas import lib NOT found (DLL may exist but .lib is missing)"
+          Write-Host "Patching cmake to make MKL::MKL_SYCL::* optional..."
           $lines = Get-Content $file
           $out   = [System.Collections.Generic.List[string]]::new()
           foreach ($line in $lines) {
@@ -228,6 +231,64 @@ jobs:
           # oneAPI-specific MKL search paths)
           $env:ONEAPI_ROOT = "$condaPrefix\Library"
           Write-Host "ONEAPI_ROOT=$($env:ONEAPI_ROOT)"
+
+          # ── Generate mkl_sycl_blas import library if missing ─────────────
+          # conda mkl-dpcpp ships mkl_sycl_blas.5.dll but not the import .lib.
+          # cmake FindMKL needs the .lib to create the MKL::MKL_SYCL::BLAS target.
+          # We generate it from the DLL using lib.exe (available after MSVC setup).
+          $mklLibDir = "$condaPrefix\Library\lib"
+          $mklBinDir = "$condaPrefix\Library\bin"
+          $syclBlasLib = Get-ChildItem $mklLibDir -Filter "mkl_sycl_blas*dll*.lib" `
+                         -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $syclBlasLib) {
+            Write-Host "mkl_sycl_blas import lib missing — trying to generate from DLL..."
+            $syclBlasDll = Get-ChildItem $mklBinDir -Filter "mkl_sycl_blas*.dll" `
+                           -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($syclBlasDll) {
+              Write-Host "Found DLL: $($syclBlasDll.FullName)"
+              # lib.exe is in PATH after ilammy/msvc-dev-cmd
+              $libExePath = (Get-Command lib.exe -ErrorAction SilentlyContinue)?.Source
+              $dumpbinPath = $null
+              if ($libExePath) {
+                $dumpbinPath = Join-Path (Split-Path $libExePath -Parent) "dumpbin.exe"
+                if (-not (Test-Path $dumpbinPath)) { $dumpbinPath = $null }
+              }
+              if ($libExePath -and $dumpbinPath) {
+                Write-Host "Using: $libExePath"
+                # Get export list
+                $rawExports = & $dumpbinPath /exports $syclBlasDll.FullName 2>&1
+                # Build .def file
+                $dllBase = $syclBlasDll.BaseName -replace '\.\d+$', ''   # strip version suffix
+                $defLines = [System.Collections.Generic.List[string]]::new()
+                $defLines.Add("LIBRARY $dllBase")
+                $defLines.Add("EXPORTS")
+                $inSection = $false
+                foreach ($exportLine in $rawExports) {
+                  if ($exportLine -match '^\s+ordinal\s+hint\s+RVA\s+name') { $inSection = $true; continue }
+                  if ($inSection -and $exportLine -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)\s*$') {
+                    $defLines.Add("    $($Matches[1])")
+                  }
+                }
+                $defFile  = "$mklLibDir\mkl_sycl_blas.def"
+                $outLib   = "$mklLibDir\mkl_sycl_blas_dll.lib"
+                $defLines | Set-Content $defFile -Encoding ASCII
+                Write-Host "DEF file written with $($defLines.Count - 2) exports"
+                & $libExePath /def:$defFile /machine:x64 /out:$outLib 2>&1 | ForEach-Object { Write-Host $_ }
+                if (Test-Path $outLib) {
+                  $kb = [int]((Get-Item $outLib).Length / 1KB)
+                  Write-Host "Generated: $outLib ($kb KB) — cmake will now find MKL::MKL_SYCL::BLAS"
+                } else {
+                  Write-Host "lib.exe did not produce the import library — cmake patch will handle this"
+                }
+              } else {
+                Write-Host "lib.exe/dumpbin.exe not found in PATH — cmake patch will handle this"
+              }
+            } else {
+              Write-Host "mkl_sycl_blas DLL not found — cmake patch will handle this"
+            }
+          } else {
+            Write-Host "mkl_sycl_blas import lib already present: $($syclBlasLib.FullName)"
+          }
 
           # ── Run CMake ────────────────────────────────────────────────────
           cmake -S llama_cpp_src -B llama_cpp_src\build `
