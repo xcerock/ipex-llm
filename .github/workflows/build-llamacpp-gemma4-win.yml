@@ -82,34 +82,42 @@ jobs:
       - name: Install Intel oneAPI via conda
         shell: bash -l {0}
         run: |
-          # dpcpp_impl_win-64   → icx.exe compiler
-          # mkl-devel           → MKL headers + classic (CPU) import libs
-          # mkl-dpcpp           → MKL SYCL BLAS component (mkl_sycl_blas.dll)
-          # tbb-devel           → TBB
-          conda install -y -c conda-forge opencl-headers \
+          conda install -y \
             -c https://software.repos.intel.com/python/conda/ \
             -c conda-forge \
             dpcpp_impl_win-64 \
             dpcpp-cpp-rt \
             mkl-devel \
             mkl-dpcpp \
-            tbb-devel
+            tbb-devel \
+            opencl-headers \
+            ocl-icd
+
           echo "Installed packages:"
-          conda list | grep -E "dpcpp|mkl|tbb|unified"
+          conda list | grep -E "dpcpp|mkl|tbb|opencl"
           echo "---"
-          # Report whether mkl_sycl_blas.dll is now present
+
+          # Verificar que cl.h existe
+          if find "$CONDA_PREFIX" -path "*/CL/cl.h" 2>/dev/null | grep -q .; then
+            echo "OK: OpenCL headers (CL/cl.h) found"
+          else
+            echo "ERROR: CL/cl.h not found — build will fail"
+          fi
+
+          # Report whether mkl_sycl_blas.dll is present
           if find "$CONDA_PREFIX" -name "mkl_sycl_blas*.dll" 2>/dev/null | grep -q .; then
             echo "OK: mkl_sycl_blas found"
           else
             echo "WARNING: mkl_sycl_blas.dll still absent — cmake will be patched"
           fi
-          # Report whether ur_api.h is present (needed by sycl/buffer.hpp)
+
+          # Report whether ur_api.h is present
           if find "$CONDA_PREFIX" -name "ur_api.h" 2>/dev/null | grep -q .; then
             echo "OK: ur_api.h found"
-            find "$CONDA_PREFIX" -name "ur_api.h" 2>/dev/null
           else
             echo "WARNING: ur_api.h not found — configure step will download it"
           fi
+
           ICX=$(find "$CONDA_PREFIX" -name "icx.exe" 2>/dev/null | head -1)
           echo "ICX compiler: $ICX"
           echo "CONDA_PREFIX=$CONDA_PREFIX" >> $GITHUB_ENV
